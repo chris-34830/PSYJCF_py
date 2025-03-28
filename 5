@@ -1,0 +1,91 @@
+Option Explicit
+
+' Constants pour la configuration du portefeuille
+Const ESG_RATIO As Double = 0.7
+Const CRYPTO_RATIO As Double = 0.3
+Const MAX_WEIGHT_PER_ASSET As Double = 0.15
+Const MAX_CRYPTO_VOL_CONTRIB As Double = 0.4
+Const RISK_FREE_RATE As Double = 0
+
+' Indices des actifs
+Const FIRST_ESG_ASSET As Integer = 2   ' Colonne B
+Const LAST_ESG_ASSET As Integer = 11   ' Colonne K (10 actifs ESG)
+Const FIRST_CRYPTO_ASSET As Integer = 12 ' Colonne L
+Const LAST_CRYPTO_ASSET As Integer = 14  ' Colonne N (3 cryptomonnaies)
+
+' Sous-procédure principale
+Sub OptimiserPortefeuille()
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    
+    ' Créer des feuilles pour les résultats s'ils n'existent pas
+    CreateSheetsIfNotExist
+    
+    ' Étape 1: Lire les données et calculer les rendements
+    Dim dataRange As Range
+    Set dataRange = Sheets("Data").Range("A1:N1293")
+    
+    Dim returns As Variant
+    Dim nbAssets As Integer
+    nbAssets = LAST_CRYPTO_ASSET - FIRST_ESG_ASSET + 1 ' Nombre total d'actifs
+    
+    returns = CalculateReturns(dataRange)
+    
+    ' Étape 2: Calculer les matrices nécessaires pour l'optimisation
+    Dim meanReturns As Variant
+    Dim covMatrix As Variant
+    
+    meanReturns = CalculateMeanReturns(returns)
+    covMatrix = CalculateCovarianceMatrix(returns)
+    
+    ' Étape 3: Optimiser avec les différentes méthodes
+    Dim resultsMV As Variant
+    Dim resultsCF As Variant
+    Dim resultsLPM As Variant
+    Dim resultsMEG As Variant
+    
+    ' Optimisation de Markowitz (Mean-Variance)
+    resultsMV = OptimizeMeanVariance(meanReturns, covMatrix)
+    
+    ' Optimisation Mean-VaR Cornish-Fisher
+    resultsCF = OptimizeMeanVaRCornishFisher(returns, meanReturns, covMatrix)
+    
+    ' Optimisation Mean-Lower Partial Moment
+    resultsLPM = OptimizeMeanLPM(returns, meanReturns)
+    
+    ' Optimisation Mean-Extended Gini
+    resultsMEG = OptimizeMeanExtendedGini(returns, meanReturns)
+    
+    ' Étape 4: Calculer les performances et comparer les approches
+    DisplayResults resultsMV, resultsCF, resultsLPM, resultsMEG, meanReturns, covMatrix, returns
+    
+    ' Étape 5: Générer les frontières efficientes
+    GenerateEfficientFrontier meanReturns, covMatrix, returns
+    
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+    
+    MsgBox "Optimisation de portefeuille terminée! Vérifiez les résultats dans les feuilles créées.", vbInformation
+End Sub
+
+' Crée les feuilles nécessaires si elles n'existent pas
+Sub CreateSheetsIfNotExist()
+    Dim sheetNames As Variant
+    sheetNames = Array("Résultats", "Frontières", "Portefeuilles")
+    
+    Dim i As Integer
+    For i = LBound(sheetNames) To UBound(sheetNames)
+        If Not SheetExists(sheetNames(i)) Then
+            Sheets.Add(After:=Sheets(Sheets.Count)).Name = sheetNames(i)
+        Else
+            Sheets(sheetNames(i)).Cells.Clear
+        End If
+    Next i
+End Sub
+
+' Vérifie si une feuille existe
+Function SheetExists(sheetName As String) As Boolean
+    Dim ws As Worksheet
+    
+    On Error Resume Next
+    Set ws
