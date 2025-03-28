@@ -1,0 +1,33 @@
+Function CalculateMeanReturns(returns As Variant) As Variant
+    Dim nbRows As Long, nbCols As Long
+    Dim i As Long, j As Long
+    Dim sumVal As Double
+    
+    ' Déterminer le nombre de lignes et de colonnes du tableau "returns"
+    nbRows = UBound(returns, 1)
+    nbCols = UBound(returns, 2)
+    
+    Dim meanReturns() As Double
+    ReDim meanReturns(1 To nbCols)
+    
+    For j = 1 To nbCols
+        sumVal = 0
+        For i = 1 To nbRows
+            ' Vérifier que la valeur est numérique avant de l'additionner
+            If IsNumeric(returns(i, j)) Then
+                sumVal = sumVal + CDbl(returns(i, j))
+            Else
+                sumVal = sumVal + 0
+            End If
+        Next i
+        ' S'assurer que nbRows n'est pas zéro pour éviter une division par zéro
+        If nbRows <> 0 Then
+            ' Calculer le rendement moyen quotidien puis annualiser (en supposant 252 jours de trading)
+            meanReturns(j) = (sumVal / nbRows) * 252
+        Else
+            meanReturns(j) = 0
+        End If
+    Next j
+    
+    CalculateMeanReturns = meanReturns
+End Function
