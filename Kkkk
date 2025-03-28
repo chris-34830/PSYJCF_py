@@ -1,0 +1,771 @@
+Option Explicit
+
+' Constants pour la configuration du portefeuille
+Const ESG_RATIO As Double = 0.7
+Const CRYPTO_RATIO As Double = 0.3
+Const MAX_WEIGHT_PER_ASSET As Double = 0.15
+Const MAX_CRYPTO_VOL_CONTRIB As Double = 0.4
+Const RISK_FREE_RATE As Double = 0
+
+' Indices des actifs
+Const FIRST_ESG_ASSET As Integer = 2    ' Colonne B
+Const LAST_ESG_ASSET As Integer = 11    ' Colonne K (10 actifs ESG)
+Const FIRST_CRYPTO_ASSET As Integer = 12 ' Colonne L
+Const LAST_CRYPTO_ASSET As Integer = 14  ' Colonne N (3 cryptomonnaies)
+
+'====================================================================
+' Sous-procédure principale
+'====================================================================
+Sub OptimiserPortefeuille()
+    Dim dataRange As Range
+    Dim returns As Variant, meanReturns As Variant, covMatrix As Variant
+    
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    
+    ' Créer des feuilles pour les résultats s'ils n'existent pas
+    CreateSheetsIfNotExist
+    
+    ' --- Étape 1: Lire les données et calculer les rendements
+    Set dataRange = Sheets("Data").Range("A1:N1293")
+    returns = CalculateReturns(dataRange)
+    
+    ' --- Étape 2: Calculer les matrices nécessaires pour l'optimisation
+    meanReturns = CalculateMeanReturns(returns)
+    covMatrix = CalculateCovarianceMatrix(returns)
+    
+    ' --- Étape 3: Exemple d'optimisation pour la méthode CF avec 3 scénarios
+    '     (Vous pouvez faire la même chose pour MV, LPM, Gini, etc.)
+    Dim wCF_minRisk As Variant, wCF_balanced As Variant, wCF_maxReturn As Variant
+    
+    wCF_minRisk = OptimizeCFScenario(returns, meanReturns, covMatrix, "MinRisk")
+    wCF_balanced = OptimizeCFScenario(returns, meanReturns, covMatrix, "Balanced")
+    wCF_maxReturn = OptimizeCFScenario(returns, meanReturns, covMatrix, "MaxReturn")
+    
+    ' --- Étape 4: Affichage des résultats (exemple : on affiche juste la CF + 3 scénarios)
+    '     Vous pouvez évidemment inclure Markowitz, LPM, etc. en parallèle.
+    DisplayCFScenarios wCF_minRisk, wCF_balanced, wCF_maxReturn, meanReturns, covMatrix, returns
+    
+    ' --- Étape 5: Générer les frontières efficientes (optionnel)
+    '     Vous pouvez ajuster ou le supprimer si besoin.
+    GenerateEfficientFrontier meanReturns, covMatrix, returns
+    
+    Application.Calculation = xlCalculationAutomatic
+    Application.ScreenUpdating = True
+    
+    MsgBox "Optimisation de portefeuille terminée! Vérifiez les résultats dans les feuilles créées.", vbInformation
+End Sub
+
+'====================================================================
+' Créer les feuilles nécessaires si elles n'existent pas
+'====================================================================
+Sub CreateSheetsIfNotExist()
+    Dim sheetNames As Variant
+    sheetNames = Array("Résultats", "Frontières", "Portefeuilles")
+    Dim i As Integer
+    
+    For i = LBound(sheetNames) To UBound(sheetNames)
+        If Not SheetExists(sheetNames(i)) Then
+            Sheets.Add(After:=Sheets(Sheets.Count)).Name = sheetNames(i)
+        Else
+            Sheets(sheetNames(i)).Cells.Clear
+        End If
+    Next i
+End Sub
+
+Function SheetExists(sheetName As String) As Boolean
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = Sheets(sheetName)
+    On Error GoTo 0
+    SheetExists = Not ws Is Nothing
+End Function
+
+'====================================================================
+' Calcule les rendements logarithmiques à partir des prix
+'====================================================================
+Function CalculateReturns(dataRange As Range) As Variant
+    Dim nbRows As Long, nbCols As Long
+    Dim i As Long, j As Long
+    Dim arrReturns() As Double
+    Dim valCurrent As Double, valPrevious As Double
+    
+    nbRows = dataRange.Rows.Count - 1
+    nbCols = LAST_CRYPTO_ASSET - FIRST_ESG_ASSET + 1
+    
+    ReDim arrReturns(1 To nbRows, 1 To nbCols)
+    
+    For i = 1 To nbRows
+        For j = 1 To nbCols
+            If IsNumeric(dataRange.Cells(i + 1, j + FIRST_ESG_ASSET - 1).Value) And _
+               IsNumeric(dataRange.Cells(i, j + FIRST_ESG_ASSET - 1).Value) Then
+               
+                valCurrent = CDbl(dataRange.Cells(i, j + FIRST_ESG_ASSET - 1).Value)
+                valPrevious = CDbl(dataRange.Cells(i + 1, j + FIRST_ESG_ASSET - 1).Value)
+                
+                If valCurrent > 0 And valPrevious > 0 Then
+                    arrReturns(i, j) = Log(valPrevious / valCurrent)
+                Else
+                    arrReturns(i, j) = 0
+                End If
+            Else
+                arrReturns(i, j) = 0
+            End If
+        Next j
+    Next i
+    
+    CalculateReturns = arrReturns
+End Function
+
+'====================================================================
+' Calcule les rendements moyens annualisés
+'====================================================================
+Function CalculateMeanReturns(returns As Variant) As Variant
+    Dim nbRows As Long, nbCols As Long
+    Dim i As Long, j As Long
+    Dim sumVal As Double
+    
+    nbRows = UBound(returns, 1)
+    nbCols = UBound(returns, 2)
+    
+    Dim meanRet() As Double
+    ReDim meanRet(1 To nbCols)
+    
+    For j = 1 To nbCols
+        sumVal = 0
+        For i = 1 To nbRows
+            sumVal = sumVal + returns(i, j)
+        Next i
+        meanRet(j) = (sumVal / nbRows) * 252  ' Annualisation
+    Next j
+    
+    CalculateMeanReturns = meanRet
+End Function
+
+'====================================================================
+' Calcule la matrice de covariance annualisée
+'====================================================================
+Function CalculateCovarianceMatrix(returns As Variant) As Variant
+    Dim nbRows As Long, nbCols As Long
+    Dim i As Long, j As Long, k As Long
+    Dim sumVal As Double, covariance As Double
+    
+    nbRows = UBound(returns, 1)
+    nbCols = UBound(returns, 2)
+    
+    Dim meanRet() As Double
+    ReDim meanRet(1 To nbCols)
+    
+    ' Moyenne de chaque actif (non annualisée, juste la moyenne "brute")
+    For j = 1 To nbCols
+        sumVal = 0
+        For i = 1 To nbRows
+            sumVal = sumVal + returns(i, j)
+        Next i
+        meanRet(j) = sumVal / nbRows
+    Next j
+    
+    ' Matrice de covariance
+    Dim covMatrix() As Double
+    ReDim covMatrix(1 To nbCols, 1 To nbCols)
+    
+    For j = 1 To nbCols
+        For k = 1 To nbCols
+            covariance = 0
+            For i = 1 To nbRows
+                covariance = covariance + (returns(i, j) - meanRet(j)) * (returns(i, k) - meanRet(k))
+            Next i
+            covMatrix(j, k) = (covariance / (nbRows - 1)) * 252
+        Next k
+    Next j
+    
+    CalculateCovarianceMatrix = covMatrix
+End Function
+
+'####################################################################
+'         1) CALCUL DE LA VAR CORNISH–FISHER (MODIFIÉ)
+'####################################################################
+Function CalculatePortfolioVaRCF( _
+    ByVal weights As Variant, _
+    ByVal returns As Variant, _
+    ByVal meanReturns As Variant, _
+    ByVal covMatrix As Variant, _
+    ByVal alpha As Double _
+) As Double
+    ' alpha = 0.05 pour un VaR à 95%, par exemple
+    
+    Dim portMean As Double, portRisk As Double
+    Dim portSkew As Double, portKurt As Double
+    
+    portMean = CalculatePortfolioReturn(weights, meanReturns)
+    portRisk = CalculatePortfolioRisk(weights, covMatrix)
+    portSkew = PortfolioSkewness(weights, returns)
+    portKurt = PortfolioKurtosis(weights, returns)
+    
+    ' z alpha pour la gaussienne => ici alpha=0.05 => z = NormSInv(0.05) = ~ -1.645
+    Dim z As Double
+    z = Application.WorksheetFunction.NormSInv(alpha)
+    
+    ' Expansion de Cornish-Fisher
+    Dim zCF As Double
+    zCF = z _
+           + ((z ^ 2 - 1) * portSkew) / 6 _
+           + ((z ^ 3 - 3 * z) * portKurt) / 24 _
+           - ((2 * z ^ 3 - 5 * z) * (portSkew ^ 2)) / 36
+    
+    ' Quantile (rendement) approché
+    Dim qAlpha As Double
+    qAlpha = portMean + portRisk * zCF
+    
+    ' VaR = la perte => si qAlpha < 0, la perte est -qAlpha
+    ' si qAlpha >= 0, on considère que la perte sur ce quantile est 0
+    If qAlpha < 0 Then
+        CalculatePortfolioVaRCF = -qAlpha
+    Else
+        CalculatePortfolioVaRCF = 0
+    End If
+End Function
+
+'####################################################################
+'       2) OPTIMISATION CF SELON 3 SCÉNARIOS (MinRisk, Balanced, etc.)
+'####################################################################
+
+Function OptimizeCFScenario( _
+    ByVal returns As Variant, _
+    ByVal meanReturns As Variant, _
+    ByVal covMatrix As Variant, _
+    ByVal scenario As String _
+) As Variant
+    '
+    ' Trois scénarios possibles (scenario):
+    ' 1) "MinRisk"   => On minimise la VaR Cornish–Fisher
+    ' 2) "Balanced"  => On maximise (Return - Rf)/VaR_CornishFisher
+    ' 3) "MaxReturn" => On maximise simplement le rendement
+    '
+    
+    Dim nbAssets As Integer
+    nbAssets = UBound(meanReturns)
+    
+    Dim bestWeights() As Double
+    ReDim bestWeights(1 To nbAssets)
+    
+    ' On part par défaut d'un portefeuille pro-rata ESG & Crypto
+    Dim i As Long
+    Dim esgCount As Long, cryptoCount As Long
+    esgCount = LAST_ESG_ASSET - FIRST_ESG_ASSET + 1
+    cryptoCount = LAST_CRYPTO_ASSET - FIRST_CRYPTO_ASSET + 1
+    
+    Dim w() As Double
+    ReDim w(1 To nbAssets)
+    For i = 1 To esgCount
+        w(i) = ESG_RATIO / esgCount
+    Next i
+    For i = esgCount + 1 To nbAssets
+        w(i) = CRYPTO_RATIO / cryptoCount
+    Next i
+    
+    ' Calcul du "score" initial selon le scénario
+    Dim bestScore As Double
+    bestScore = EvaluateCFObjective(w, returns, meanReturns, covMatrix, scenario)
+    For i = 1 To nbAssets
+        bestWeights(i) = w(i)
+    Next i
+    
+    ' Nombre d'itérations de recherche aléatoire
+    Dim iterations As Long
+    iterations = 3000
+    
+    Dim j As Long, candidate() As Double, candidateScore As Double
+    Dim stepSize As Double
+    
+    Randomize
+    For i = 1 To iterations
+        ' On copie w dans candidate
+        ReDim candidate(1 To nbAssets)
+        For j = 1 To nbAssets
+            candidate(j) = w(j)
+        Next j
+        
+        ' On applique de petites perturbations aléatoires
+        For j = 1 To nbAssets
+            stepSize = (Rnd - 0.5) * 0.02  ' +/- 1% environ
+            candidate(j) = candidate(j) + stepSize
+        Next j
+        
+        ' Projection sur les contraintes
+        candidate = ProjectOnConstraints(candidate, esgCount, cryptoCount, covMatrix)
+        
+        ' On évalue le nouveau score
+        candidateScore = EvaluateCFObjective(candidate, returns, meanReturns, covMatrix, scenario)
+        
+        ' Suivant le scénario, on remplace si c'est meilleur
+        '   - MinRisk => objectif = "VaR la plus petite possible" => on cherche le plus PETIT
+        '   - Balanced => objectif = "Sharpe" => on cherche le plus GRAND
+        '   - MaxReturn => on cherche le plus GRAND
+        '
+        Select Case scenario
+            Case "MinRisk"
+                ' ICI le "score" = VaR => on cherche un MIN
+                If candidateScore < bestScore Then
+                    bestScore = candidateScore
+                    For j = 1 To nbAssets
+                        bestWeights(j) = candidate(j)
+                    Next j
+                End If
+                
+            Case "Balanced", "MaxReturn"
+                ' On cherche le MAX
+                If candidateScore > bestScore Then
+                    bestScore = candidateScore
+                    For j = 1 To nbAssets
+                        bestWeights(j) = candidate(j)
+                    Next j
+                End If
+        End Select
+        
+        ' On peut aussi mettre à jour w de temps en temps pour élargir la recherche
+        If (i Mod 50) = 0 Then
+            For j = 1 To nbAssets
+                w(j) = bestWeights(j)
+            Next j
+        End If
+    Next i
+    
+    OptimizeCFScenario = bestWeights
+End Function
+
+'====================================================================
+' Évaluation de l'objectif selon le scénario
+'====================================================================
+Function EvaluateCFObjective( _
+    ByVal w As Variant, _
+    ByVal returns As Variant, _
+    ByVal meanReturns As Variant, _
+    ByVal covMatrix As Variant, _
+    ByVal scenario As String _
+) As Double
+    
+    Dim portfolioReturn As Double
+    portfolioReturn = CalculatePortfolioReturn(w, meanReturns)
+    
+    Dim alphaCF As Double
+    alphaCF = 0.05  ' VaR 95% => alpha=5%
+    
+    Dim portVaR As Double
+    portVaR = CalculatePortfolioVaRCF(w, returns, meanReturns, covMatrix, alphaCF)
+    
+    Select Case scenario
+        Case "MinRisk"
+            ' Ici, on veut minimiser VaR => on renvoie VaR directement (plus c'est petit, mieux c'est)
+            EvaluateCFObjective = portVaR
+            
+        Case "Balanced"
+            ' ratio style Sharpe = (Return - Rf) / VaR
+            ' si VaR=0 => ratio théoriquement infini, on limite par un grand nombre
+            If portVaR > 0 Then
+                EvaluateCFObjective = (portfolioReturn - RISK_FREE_RATE) / portVaR
+            Else
+                EvaluateCFObjective = 1.0E+10
+            End If
+            
+        Case "MaxReturn"
+            EvaluateCFObjective = portfolioReturn
+            
+    End Select
+End Function
+
+'====================================================================
+' Projection des poids sur les contraintes du problème
+'====================================================================
+Function ProjectOnConstraints(weights As Variant, esgAssets As Integer, cryptoAssets As Integer, covMatrix As Variant) As Variant
+    Dim nbAssets As Integer, i As Integer, j As Integer
+    nbAssets = UBound(weights)
+    
+    Dim projectedWeights() As Double
+    ReDim projectedWeights(1 To nbAssets)
+    
+    For i = 1 To nbAssets
+        projectedWeights(i) = weights(i)
+    Next i
+    
+    ' 1. Contrainte de poids maximum par actif et poids non négatifs
+    For i = 1 To nbAssets
+        If projectedWeights(i) > MAX_WEIGHT_PER_ASSET Then
+            projectedWeights(i) = MAX_WEIGHT_PER_ASSET
+        End If
+        If projectedWeights(i) < 0 Then
+            projectedWeights(i) = 0
+        End If
+    Next i
+    
+    ' 2. Normaliser les poids des actifs ESG pour maintenir 70%
+    Dim sumESG As Double, sumCrypto As Double
+    sumESG = 0
+    For i = 1 To esgAssets
+        sumESG = sumESG + projectedWeights(i)
+    Next i
+    If sumESG > 0 Then
+        For i = 1 To esgAssets
+            projectedWeights(i) = projectedWeights(i) * ESG_RATIO / sumESG
+        Next i
+    End If
+    
+    ' 3. Normaliser les poids des cryptomonnaies pour maintenir 30%
+    sumCrypto = 0
+    For i = esgAssets + 1 To nbAssets
+        sumCrypto = sumCrypto + projectedWeights(i)
+    Next i
+    If sumCrypto > 0 Then
+        For i = esgAssets + 1 To nbAssets
+            projectedWeights(i) = projectedWeights(i) * CRYPTO_RATIO / sumCrypto
+        Next i
+    End If
+    
+    ' 4. Vérifier la contribution à la volatilité des cryptomonnaies
+    Dim portfolioRisk As Double
+    portfolioRisk = CalculatePortfolioRisk(projectedWeights, covMatrix)
+    
+    Dim cryptoContrib As Double
+    cryptoContrib = 0
+    For i = esgAssets + 1 To nbAssets
+        For j = 1 To nbAssets
+            cryptoContrib = cryptoContrib + projectedWeights(i) * projectedWeights(j) * covMatrix(i, j)
+        Next j
+    Next i
+    If portfolioRisk <> 0 Then
+        cryptoContrib = cryptoContrib / (portfolioRisk ^ 2)
+    Else
+        cryptoContrib = 0
+    End If
+    
+    If cryptoContrib > MAX_CRYPTO_VOL_CONTRIB Then
+        Dim adjustFactor As Double, totalCryptoReduc As Double
+        adjustFactor = Sqr(MAX_CRYPTO_VOL_CONTRIB / cryptoContrib)
+        
+        For i = esgAssets + 1 To nbAssets
+            projectedWeights(i) = projectedWeights(i) * adjustFactor
+        Next i
+        
+        totalCryptoReduc = CRYPTO_RATIO * (1 - adjustFactor)
+        For i = 1 To esgAssets
+            projectedWeights(i) = projectedWeights(i) * (ESG_RATIO + totalCryptoReduc) / ESG_RATIO
+        Next i
+    End If
+    
+    ProjectOnConstraints = projectedWeights
+End Function
+
+'====================================================================
+' Calculer le rendement du portefeuille
+'====================================================================
+Function CalculatePortfolioReturn(weights As Variant, meanReturns As Variant) As Double
+    Dim portfolioReturn As Double, i As Integer
+    For i = 1 To UBound(weights)
+        portfolioReturn = portfolioReturn + weights(i) * meanReturns(i)
+    Next i
+    CalculatePortfolioReturn = portfolioReturn
+End Function
+
+'====================================================================
+' Calculer le risque (écart-type) du portefeuille
+'====================================================================
+Function CalculatePortfolioRisk(weights As Variant, covMatrix As Variant) As Double
+    Dim portfolioVar As Double, i As Integer, j As Integer
+    For i = 1 To UBound(weights)
+        For j = 1 To UBound(weights)
+            portfolioVar = portfolioVar + weights(i) * weights(j) * covMatrix(i, j)
+        Next j
+    Next i
+    CalculatePortfolioRisk = Sqr(portfolioVar)
+End Function
+
+'====================================================================
+' Calcul de la skewness du portefeuille
+'====================================================================
+Function PortfolioSkewness(weights As Variant, returns As Variant) As Double
+    Dim nbObs As Long, nbAssets As Long, i As Long, j As Long
+    nbObs = UBound(returns, 1)
+    nbAssets = UBound(returns, 2)
+    
+    Dim portReturn() As Double
+    ReDim portReturn(1 To nbObs)
+    
+    ' Construire la série de rendements du portefeuille
+    For i = 1 To nbObs
+        portReturn(i) = 0
+        For j = 1 To nbAssets
+            portReturn(i) = portReturn(i) + weights(j) * returns(i, j)
+        Next j
+    Next i
+    
+    ' Moyenne et écart-type
+    Dim meanP As Double, stdP As Double
+    For i = 1 To nbObs
+        meanP = meanP + portReturn(i)
+    Next i
+    meanP = meanP / nbObs
+    
+    Dim sumSq As Double
+    For i = 1 To nbObs
+        sumSq = sumSq + (portReturn(i) - meanP) ^ 2
+    Next i
+    If nbObs > 1 Then
+        stdP = Sqr(sumSq / (nbObs - 1))
+    Else
+        PortfolioSkewness = 0
+        Exit Function
+    End If
+    
+    If stdP = 0 Then
+        PortfolioSkewness = 0
+        Exit Function
+    End If
+    
+    ' Calcul du numérateur de la skewness
+    Dim sumCube As Double
+    For i = 1 To nbObs
+        sumCube = sumCube + (portReturn(i) - meanP) ^ 3
+    Next i
+    
+    PortfolioSkewness = (sumCube / nbObs) / (stdP ^ 3)
+End Function
+
+'====================================================================
+' Calcul de la kurtosis du portefeuille (excès de kurtosis)
+'====================================================================
+Function PortfolioKurtosis(weights As Variant, returns As Variant) As Double
+    Dim nbObs As Long, nbAssets As Long, i As Long, j As Long
+    nbObs = UBound(returns, 1)
+    nbAssets = UBound(returns, 2)
+    
+    Dim portReturn() As Double
+    ReDim portReturn(1 To nbObs)
+    
+    ' Construire la série de rendements du portefeuille
+    For i = 1 To nbObs
+        portReturn(i) = 0
+        For j = 1 To nbAssets
+            portReturn(i) = portReturn(i) + weights(j) * returns(i, j)
+        Next j
+    Next i
+    
+    ' Moyenne et écart-type
+    Dim meanP As Double, stdP As Double
+    Dim sumSq As Double
+    
+    For i = 1 To nbObs
+        meanP = meanP + portReturn(i)
+    Next i
+    meanP = meanP / nbObs
+    
+    For i = 1 To nbObs
+        sumSq = sumSq + (portReturn(i) - meanP) ^ 2
+    Next i
+    If nbObs > 1 Then
+        stdP = Sqr(sumSq / (nbObs - 1))
+    Else
+        PortfolioKurtosis = 0
+        Exit Function
+    End If
+    
+    If stdP = 0 Then
+        PortfolioKurtosis = 0
+        Exit Function
+    End If
+    
+    Dim sumQuad As Double
+    For i = 1 To nbObs
+        sumQuad = sumQuad + (portReturn(i) - meanP) ^ 4
+    Next i
+    
+    PortfolioKurtosis = (sumQuad / nbObs) / (stdP ^ 4) - 3
+End Function
+
+'####################################################################
+'          AFFICHE LES 3 SCÉNARIOS DANS LA FEUILLE "RÉSULTATS"
+'####################################################################
+Sub DisplayCFScenarios( _
+    ByVal wMinRisk As Variant, _
+    ByVal wBalanced As Variant, _
+    ByVal wMaxReturn As Variant, _
+    ByVal meanReturns As Variant, _
+    ByVal covMatrix As Variant, _
+    ByVal returns As Variant _
+)
+    Dim ws As Worksheet
+    Set ws = Sheets("Résultats")
+    
+    ws.Range("A1").Value = "Scénario CF"
+    ws.Range("B1").Value = "Rendement"
+    ws.Range("C1").Value = "Risque (stdev)"
+    ws.Range("D1").Value = "VaR(95%)"
+    ws.Range("E1").Value = "Ratio CF ( (Return-Rf)/VaR )"
+    
+    ' On nomme les colonnes pour les poids
+    Dim esgCount As Long, cryptoCount As Long, nbAssets As Long
+    esgCount = LAST_ESG_ASSET - FIRST_ESG_ASSET + 1
+    cryptoCount = LAST_CRYPTO_ASSET - FIRST_CRYPTO_ASSET + 1
+    nbAssets = esgCount + cryptoCount
+    
+    Dim i As Long
+    For i = 1 To esgCount
+        ws.Cells(1, 5 + i).Value = "ESG " & i
+    Next i
+    For i = 1 To cryptoCount
+        ws.Cells(1, 5 + esgCount + i).Value = "Crypto " & i
+    Next i
+    
+    '=== Ligne 2 : CF - MinRisk
+    ws.Range("A2").Value = "CF - MinRisk"
+    Call FillCFLine(ws, 2, wMinRisk, meanReturns, covMatrix, returns)
+    
+    '=== Ligne 3 : CF - Balanced (Sharpe)
+    ws.Range("A3").Value = "CF - Balanced"
+    Call FillCFLine(ws, 3, wBalanced, meanReturns, covMatrix, returns)
+    
+    '=== Ligne 4 : CF - MaxReturn
+    ws.Range("A4").Value = "CF - MaxReturn"
+    Call FillCFLine(ws, 4, wMaxReturn, meanReturns, covMatrix, returns)
+    
+    ws.Range("A1:Z1").Font.Bold = True
+    ws.Columns("A:Z").AutoFit
+End Sub
+
+Private Sub FillCFLine( _
+    ByVal ws As Worksheet, _
+    ByVal rowIndex As Long, _
+    ByVal weights As Variant, _
+    ByVal meanReturns As Variant, _
+    ByVal covMatrix As Variant, _
+    ByVal returns As Variant _
+)
+    Dim portRet As Double, portRisk As Double, portVaR As Double, ratioCF As Double
+    portRet = CalculatePortfolioReturn(weights, meanReturns)
+    portRisk = CalculatePortfolioRisk(weights, covMatrix)
+    portVaR = CalculatePortfolioVaRCF(weights, returns, meanReturns, covMatrix, 0.05)
+    
+    ' Ratio CF = (Return - Rf) / VaR
+    If portVaR > 0 Then
+        ratioCF = (portRet - RISK_FREE_RATE) / portVaR
+    Else
+        ratioCF = 0
+    End If
+    
+    ws.Cells(rowIndex, 2).Value = portRet
+    ws.Cells(rowIndex, 3).Value = portRisk
+    ws.Cells(rowIndex, 4).Value = portVaR
+    ws.Cells(rowIndex, 5).Value = ratioCF
+    
+    Dim nbAssets As Long
+    nbAssets = UBound(weights)
+    
+    Dim j As Long
+    For j = 1 To nbAssets
+        ws.Cells(rowIndex, 5 + j).Value = weights(j)
+    Next j
+End Sub
+
+'####################################################################
+' Génération de la frontière efficiente (optionnel / exemple)
+'####################################################################
+Sub GenerateEfficientFrontier(meanReturns As Variant, covMatrix As Variant, returns As Variant)
+    Dim ws As Worksheet
+    Set ws = Sheets("Frontières")
+    
+    ws.Range("A1").Value = "Risque"
+    ws.Range("B1").Value = "Rendement"
+    ws.Range("C1").Value = "Méthode"
+    
+    ' Ici on ne trace qu'une "pseudo-frontière" pour Markowitz ou autre
+    ' => Vous pouvez adapter le code à votre convenance.
+    
+    ' Code d’exemple : on va reprendre la fonction GenerateFrontierPoints
+    Dim nbPoints As Integer
+    nbPoints = 20
+    
+    ' Juste un exemple avec Markowitz, CF, etc. 
+    ' Si vous voulez, vous pouvez générer des points via la CF sur des cibles de risque ou de VaR.
+    
+    ' Pour la démo, on appelle la fonction existante.
+    GenerateFrontierPoints meanReturns, covMatrix, "Mean-Variance", ws, 2, nbPoints
+    
+    Dim resultsCF As Variant
+    resultsCF = OptimizeCFScenario(returns, meanReturns, covMatrix, "Balanced")
+    GenerateFrontierPoints meanReturns, covMatrix, "CF-Balanced", ws, 2 + nbPoints, nbPoints, resultsCF
+    
+    ' Création d'un graphique rapide
+    Dim chartObj As ChartObject
+    Set chartObj = ws.ChartObjects.Add(Left:=350, Width:=500, Top:=50, Height:=400)
+    With chartObj.Chart
+        .ChartType = xlXYScatterSmooth
+        .SetSourceData Source:=ws.Range("A2:C" & (2 + 2 * nbPoints - 1))
+        .HasTitle = True
+        .ChartTitle.Text = "Frontières Efficientes (exemple)"
+        .Axes(xlValue).HasTitle = True
+        .Axes(xlValue).AxisTitle.Text = "Rendement"
+        .Axes(xlCategory).HasTitle = True
+        .Axes(xlCategory).AxisTitle.Text = "Risque"
+        .HasLegend = True
+        .Legend.Position = xlLegendPositionBottom
+        
+        .SeriesCollection(1).Name = "Mean-Variance"
+        
+        Dim s2 As Series
+        Set s2 = .SeriesCollection.NewSeries
+        s2.XValues = ws.Range("A" & (2 + nbPoints) & ":A" & (2 + 2 * nbPoints - 1))
+        s2.Values = ws.Range("B" & (2 + nbPoints) & ":B" & (2 + 2 * nbPoints - 1))
+        s2.Name = "CF-Balanced"
+    End With
+    
+    ws.Range("A1:C1").Font.Bold = True
+    ws.Columns("A:C").AutoFit
+End Sub
+
+'====================================================================
+' Générer des points sur la frontière (exemple simple)
+'====================================================================
+Sub GenerateFrontierPoints(meanReturns As Variant, covMatrix As Variant, methodName As String, _
+                           ws As Worksheet, startRow As Integer, nbPoints As Integer, _
+                           Optional initialWeights As Variant = Null)
+    Dim nbAssets As Integer
+    nbAssets = UBound(meanReturns)
+    
+    Dim w() As Double
+    ReDim w(1 To nbAssets)
+    
+    If IsMissing(initialWeights) Or IsNull(initialWeights) Then
+        ' Répartition égale
+        Dim i As Long
+        For i = 1 To nbAssets
+            w(i) = 1 / nbAssets
+        Next i
+    Else
+        Dim i As Long
+        For i = 1 To nbAssets
+            w(i) = initialWeights(i)
+        Next i
+    End If
+    
+    Dim initialReturn As Double, initialRisk As Double
+    initialReturn = CalculatePortfolioReturn(w, meanReturns)
+    initialRisk = CalculatePortfolioRisk(w, covMatrix)
+    
+    Dim stepFactor As Double
+    stepFactor = 0.02
+    
+    Dim rowIndex As Long
+    For rowIndex = 0 To nbPoints - 1
+        ' On va juste "gonfler" un actif risqué (ex : dernier) pour la démo
+        w(nbAssets) = w(nbAssets) + rowIndex * stepFactor
+        ' Normalisation + projection
+        w = ProjectOnConstraints(w, LAST_ESG_ASSET - FIRST_ESG_ASSET + 1, LAST_CRYPTO_ASSET - FIRST_CRYPTO_ASSET + 1, covMatrix)
+        
+        Dim prisk As Double, pret As Double
+        prisk = CalculatePortfolioRisk(w, covMatrix)
+        pret = CalculatePortfolioReturn(w, meanReturns)
+        
+        ws.Cells(startRow + rowIndex, 1).Value = prisk
+        ws.Cells(startRow + rowIndex, 2).Value = pret
+        ws.Cells(startRow + rowIndex, 3).Value = methodName
+    Next rowIndex
+End Sub
